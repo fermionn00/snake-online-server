@@ -244,6 +244,33 @@ class SnakeEngine {
     this.#addKillFeed(msg, [snake.id]);
   }
 
+  addSpectator(playerId) {
+    /* Add a spectator who never had a snake — just receives state broadcasts */
+    if (this.players.find((p) => p.id === playerId)) return; /* already exists */
+    const alive = [...this.snakes.values()].find((s) => s.alive);
+    this.players.push({
+      id: playerId,
+      name: `Spectator${playerId}`,
+      colorIndex: 0,
+      skinIndex: 0,
+      spectatingId: alive ? alive.id : null,
+      stats: { kills: 0, fruitsEaten: 0, maxLength: 0 },
+    });
+    /* Create a dead snake entry so getStateFor can resolve camera */
+    this.snakes.set(playerId, {
+      id: playerId,
+      name: `Spectator${playerId}`,
+      colorIndex: 0,
+      skinIndex: 0,
+      segments: [{ x: Math.floor(MAP_CONFIG.width / 2), y: Math.floor(MAP_CONFIG.height / 2) }],
+      dir: 'right',
+      nextDir: 'right',
+      alive: false,
+      deathTick: 0,
+      rank: null,
+    });
+  }
+
   step(now = Date.now()) {
     this.#flushExpiredCorpseFruits(now);
     this.#flushFruitRespawns(now);

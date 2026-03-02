@@ -11,6 +11,20 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 const feedbackItems = [];
 const MAX_FEEDBACK = 200;
 
+/* --- Global leaderboard storage --- */
+const leaderboard = { byKills: [], byLength: [] };
+const MAX_LEADERBOARD = 20;
+
+function addToLeaderboard(entry) {
+  /* entry: { name, kills, maxLength, date } */
+  leaderboard.byKills.push(entry);
+  leaderboard.byKills.sort((a, b) => b.kills - a.kills);
+  if (leaderboard.byKills.length > MAX_LEADERBOARD) leaderboard.byKills.length = MAX_LEADERBOARD;
+  leaderboard.byLength.push(entry);
+  leaderboard.byLength.sort((a, b) => b.maxLength - a.maxLength);
+  if (leaderboard.byLength.length > MAX_LEADERBOARD) leaderboard.byLength.length = MAX_LEADERBOARD;
+}
+
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
@@ -81,6 +95,30 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* GET /api/leaderboard — return top kills + top length */
+  if (req.url === '/api/leaderboard' && req.method === 'GET') {
+    res.writeHead(200, corsHeaders());
+    res.end(JSON.stringify({ ok: true, byKills: leaderboard.byKills, byLength: leaderboard.byLength }));
+    return;
+  }
+
+  /* GET /api/rooms — list active rooms for spectating */
+  if (req.url === '/api/rooms' && req.method === 'GET') {
+    const activeRooms = [];
+    for (const [id, room] of rooms) {
+      if (!room.closed) {
+        activeRooms.push({
+          id,
+          players: room.players.length,
+          phase: room.engine ? room.engine.phase : 'unknown',
+        });
+      }
+    }
+    res.writeHead(200, corsHeaders());
+    res.end(JSON.stringify({ ok: true, rooms: activeRooms }));
+    return;
+  }
+
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
   res.end('Snake Online WebSocket server is running.');
 });
@@ -91,6 +129,7 @@ let nextPlayerId = 1;
 let nextRoomId = 1;
 const clients = new Map();
 const queue = [];
+const queue1v1 = [];
 const rooms = new Map();
 let queueSince = null;
 
@@ -117,6 +156,33 @@ function removeFromQueue(playerId) {
   broadcastQueueStatus();
 }
 
+function createRoom(roomPlayers) {
+  const roomId = `room-${nextRoomId++}`;
+  const room = new GameRoom(roomId, roomPlayers, (closedId) => {
+    rooms.delete(closedId);
+    /* Save match results to leaderboard */
+    if (room.engine) {
+      const results = room.engine.getResults();
+      if (results && results.standings) {
+        for (const s of results.standings) {
+          addToLeaderboard({
+            name: s.name || `P${s.id}`,
+            kills: s.kills || 0,
+            maxLength: s.maxLength || 0,
+            date: new Date().toISOString(),
+          });
+        }
+      }
+    }
+    for (const c of clients.values()) {
+      if (c.roomId === closedId) c.roomId = null;
+    }
+  });
+  rooms.set(roomId, room);
+  room.start();
+  return room;
+}
+
 function maybeStartMatch() {
   if (queue.length < MAP_CONFIG.minPlayersToStart) return;
 
@@ -126,16 +192,23 @@ function maybeStartMatch() {
   if (queue.length === 0) queueSince = null;
   else queueSince = Date.now();
 
-  const roomId = `room-${nextRoomId++}`;
-  const room = new GameRoom(roomId, roomPlayers, (closedId) => {
-    rooms.delete(closedId);
-    for (const c of clients.values()) {
-      if (c.roomId === closedId) c.roomId = null;
-    }
-  });
-  rooms.set(roomId, room);
-  room.start();
+  createRoom(roomPlayers);
   broadcastQueueStatus();
+}
+
+function maybeStart1v1() {
+  if (queue1v1.length < 2) return;
+  const roomPlayers = queue1v1.splice(0, 2);
+  for (const p of roomPlayers) p.inQueue = false;
+  createRoom(roomPlayers);
+  broadcast1v1Status();
+}
+
+function broadcast1v1Status() {
+  const payload = { type: 'queue_update', queued: queue1v1.length, min: 2, max: 2, mode: '1v1' };
+  for (const c of clients.values()) {
+    if (c.in1v1Queue && !c.roomId) safeSend(c.ws, payload);
+  }
 }
 
 function attachPlayer(ws) {
@@ -145,15 +218,24 @@ function attachPlayer(ws) {
     name: '',
     roomId: null,
     inQueue: false,
+    in1v1Queue: false,
+    spectating: false,
   };
   clients.set(player.id, player);
   return player;
 }
 
+function removeFrom1v1Queue(playerId) {
+  const idx = queue1v1.findIndex((x) => x.id === playerId);
+  if (idx >= 0) queue1v1.splice(idx, 1);
+  broadcast1v1Status();
+}
+
 function cleanupClient(player) {
   if (!player) return;
   if (player.inQueue) removeFromQueue(player.id);
-  if (player.roomId) {
+  if (player.in1v1Queue) removeFrom1v1Queue(player.id);
+  if (player.roomId && !player.spectating) {
     const room = rooms.get(player.roomId);
     if (room) room.removePlayer(player.id);
   }
@@ -239,6 +321,52 @@ wss.on('connection', (ws) => {
       }
       return;
     }
+
+    /* --- 1v1 Queue --- */
+    if (msg.type === 'join_1v1') {
+      if (player.inQueue || player.in1v1Queue || player.roomId) return;
+      player.name = String(msg.name || '').trim().slice(0, 16) || `P${player.id}`;
+      player.skinIndex = typeof msg.skinIndex === 'number' ? Math.max(0, Math.min(7, Math.floor(msg.skinIndex))) : 0;
+      player.in1v1Queue = true;
+      queue1v1.push(player);
+      safeSend(ws, { type: 'queue_joined', playerId: player.id, name: player.name, mode: '1v1' });
+      broadcast1v1Status();
+      maybeStart1v1();
+      return;
+    }
+
+    if (msg.type === 'leave_1v1') {
+      if (!player.in1v1Queue) return;
+      player.in1v1Queue = false;
+      removeFrom1v1Queue(player.id);
+      safeSend(ws, { type: 'queue_left', mode: '1v1' });
+      return;
+    }
+
+    /* --- Spectate from lobby --- */
+    if (msg.type === 'spectate_room') {
+      const roomId = msg.roomId;
+      const room = roomId ? rooms.get(roomId) : null;
+      /* If no roomId specified, pick first active room */
+      let targetRoom = room;
+      if (!targetRoom) {
+        for (const [, r] of rooms) {
+          if (!r.closed) { targetRoom = r; break; }
+        }
+      }
+      if (!targetRoom) {
+        safeSend(ws, { type: 'error', message: 'Không có phòng nào đang chơi' });
+        return;
+      }
+      player.roomId = targetRoom.id;
+      player.spectating = true;
+      player.name = player.name || `Spectator${player.id}`;
+      targetRoom.players.push(player);
+      /* Mark as dead spectator in engine */
+      targetRoom.engine.addSpectator(player.id);
+      safeSend(ws, { type: 'spectate_joined', roomId: targetRoom.id });
+      return;
+    }
   });
 
   ws.on('close', () => cleanupClient(player));
@@ -247,6 +375,7 @@ wss.on('connection', (ws) => {
 
 setInterval(() => {
   if (queue.length >= MAP_CONFIG.minPlayersToStart) maybeStartMatch();
+  if (queue1v1.length >= 2) maybeStart1v1();
 }, 1000);
 
 server.listen(PORT, () => {
