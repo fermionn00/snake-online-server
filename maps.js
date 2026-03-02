@@ -9,7 +9,7 @@ const MAP_CONFIG = {
   detectionRadiusCells: 85,
   tickMs: 100,
   minPlayersToStart: 2,
-  maxPlayers: 10,
+  maxPlayers: 4,
   queueTimeoutMs: 60000,
   initialSnakeLength: 3,
   corpseFruitTtlMs: 30000,
