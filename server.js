@@ -131,6 +131,7 @@ const clients = new Map();
 const queue = [];
 const queue1v1 = [];
 const rooms = new Map();
+const customRooms = new Map(); /* code -> roomId mapping for invite codes */
 let queueSince = null;
 
 function queueCount() {
@@ -340,6 +341,82 @@ wss.on('connection', (ws) => {
       player.in1v1Queue = false;
       removeFrom1v1Queue(player.id);
       safeSend(ws, { type: 'queue_left', mode: '1v1' });
+      return;
+    }
+
+    /* --- Emoji Reaction --- */
+    if (msg.type === 'emoji_react') {
+      const emoji = String(msg.emoji || '').slice(0, 4);
+      const ALLOWED = ['👍', '👎', '😂', '🔥', '💀', '❤️', '😎', '🎉', '😱', '💪', '🤡', '👀'];
+      if (!emoji || !ALLOWED.includes(emoji)) return;
+      /* Rate limit: max 1 emoji per 500ms per player */
+      const now = Date.now();
+      if (player._lastEmoji && now - player._lastEmoji < 500) return;
+      player._lastEmoji = now;
+      const emojiPayload = {
+        type: 'emoji_react',
+        from: player.name || `P${player.id}`,
+        playerId: player.id,
+        emoji: emoji,
+      };
+      for (const c of clients.values()) {
+        if (player.roomId && c.roomId === player.roomId) {
+          safeSend(c.ws, emojiPayload);
+        } else if (!player.roomId && !c.roomId) {
+          safeSend(c.ws, emojiPayload);
+        }
+      }
+      return;
+    }
+
+    /* --- Custom Room: Create --- */
+    if (msg.type === 'create_custom_room') {
+      if (player.inQueue || player.in1v1Queue || player.roomId) return;
+      player.name = String(msg.name || '').trim().slice(0, 16) || `P${player.id}`;
+      player.skinIndex = typeof msg.skinIndex === 'number' ? Math.max(0, Math.min(7, Math.floor(msg.skinIndex))) : 0;
+      /* Generate 4-char invite code */
+      let code;
+      do { code = Math.random().toString(36).substring(2, 6).toUpperCase(); } while (customRooms.has(code));
+      player._customCode = code;
+      player._customWaiting = [player];
+      customRooms.set(code, { host: player, players: player._customWaiting });
+      safeSend(ws, { type: 'custom_room_created', code: code, playerId: player.id });
+      return;
+    }
+
+    /* --- Custom Room: Join --- */
+    if (msg.type === 'join_custom_room') {
+      if (player.inQueue || player.in1v1Queue || player.roomId) return;
+      const code = String(msg.code || '').trim().toUpperCase();
+      const cr = customRooms.get(code);
+      if (!cr) {
+        safeSend(ws, { type: 'error', message: 'Mã phòng không tồn tại: ' + code });
+        return;
+      }
+      if (cr.players.length >= MAP_CONFIG.maxPlayers) {
+        safeSend(ws, { type: 'error', message: 'Phòng đã đầy' });
+        return;
+      }
+      player.name = String(msg.name || '').trim().slice(0, 16) || `P${player.id}`;
+      player.skinIndex = typeof msg.skinIndex === 'number' ? Math.max(0, Math.min(7, Math.floor(msg.skinIndex))) : 0;
+      cr.players.push(player);
+      /* Notify all in custom room */
+      const joinedPayload = { type: 'custom_room_update', code: code, players: cr.players.map(p => p.name), count: cr.players.length };
+      cr.players.forEach(p => safeSend(p.ws, joinedPayload));
+      return;
+    }
+
+    /* --- Custom Room: Start --- */
+    if (msg.type === 'start_custom_room') {
+      const code = String(msg.code || '').trim().toUpperCase();
+      const cr = customRooms.get(code);
+      if (!cr || cr.host.id !== player.id) return;
+      if (cr.players.length < 2) {
+        safeSend(ws, { type: 'error', message: 'Cần ít nhất 2 người để bắt đầu' });
+        return;
+      }
+      customRooms.delete(code);
+      createRoom(cr.players);
       return;
     }
 
